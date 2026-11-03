@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -140,6 +142,156 @@ func TestCheck_ConnectionError(t *testing.T) {
 	}
 	if got.StatusCode != 0 {
 		t.Errorf("StatusCode = %d, want 0", got.StatusCode)
+	}
+}
+
+func TestCheckAll_PreservesOrder(t *testing.T) {
+	statuses := []int{http.StatusOK, http.StatusNotFound, http.StatusInternalServerError, http.StatusAccepted}
+	delays := []time.Duration{60 * time.Millisecond, 0, 30 * time.Millisecond, 10 * time.Millisecond}
+
+	urls := make([]string, len(statuses))
+	for i := range statuses {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(delays[i])
+			w.WriteHeader(statuses[i])
+		}))
+		defer srv.Close()
+		urls[i] = srv.URL
+	}
+
+	got := New(time.Second).CheckAll(context.Background(), urls, len(urls))
+
+	if len(got) != len(urls) {
+		t.Fatalf("len(results) = %d, want %d", len(got), len(urls))
+	}
+	for i, r := range got {
+		if r.URL != urls[i] || r.StatusCode != statuses[i] || r.Err != nil {
+			t.Errorf("results[%d] = %+v, want URL %q status %d", i, r, urls[i], statuses[i])
+		}
+	}
+}
+
+func TestCheckAll_MixedResults(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer ok.Close()
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := closed.URL
+	closed.Close()
+
+	urls := []string{ok.URL, "not a url", closedURL, ok.URL}
+	got := New(time.Second).CheckAll(context.Background(), urls, 2)
+
+	if len(got) != len(urls) {
+		t.Fatalf("len(results) = %d, want %d", len(got), len(urls))
+	}
+	if got[0].Err != nil || got[0].StatusCode != http.StatusOK {
+		t.Errorf("results[0] = %+v, want 200", got[0])
+	}
+	if !errors.Is(got[1].Err, ErrInvalidURL) {
+		t.Errorf("results[1].Err = %v, want ErrInvalidURL", got[1].Err)
+	}
+	if got[2].Err == nil || errors.Is(got[2].Err, ErrInvalidURL) {
+		t.Errorf("results[2].Err = %v, want connection error", got[2].Err)
+	}
+	if got[3].Err != nil || got[3].StatusCode != http.StatusOK {
+		t.Errorf("results[3] = %+v, want 200 (duplicate URL)", got[3])
+	}
+}
+
+func TestCheckAll_ConcurrencyLimit(t *testing.T) {
+	const limit, total = 3, 9
+
+	var inFlight, maxInFlight atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		n := inFlight.Add(1)
+		for {
+			m := maxInFlight.Load()
+			if n <= m || maxInFlight.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		inFlight.Add(-1)
+	}))
+	defer srv.Close()
+
+	urls := make([]string, total)
+	for i := range urls {
+		urls[i] = srv.URL
+	}
+	got := New(time.Second).CheckAll(context.Background(), urls, limit)
+
+	for i, r := range got {
+		if r.Err != nil {
+			t.Errorf("results[%d].Err = %v", i, r.Err)
+		}
+	}
+	if m := maxInFlight.Load(); m > limit {
+		t.Errorf("max in-flight = %d, want <= %d", m, limit)
+	}
+}
+
+func TestCheckAll_RunsConcurrently(t *testing.T) {
+	const total = 4
+
+	// Each handler waits until all requests have arrived, so this deadlocks (and times out) if run serially.
+	var arrived sync.WaitGroup
+	arrived.Add(total)
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		arrived.Done()
+		arrived.Wait()
+	}))
+	defer srv.Close()
+
+	urls := make([]string, total)
+	for i := range urls {
+		urls[i] = srv.URL
+	}
+	got := New(2*time.Second).CheckAll(context.Background(), urls, total)
+
+	for i, r := range got {
+		if r.Err != nil {
+			t.Errorf("results[%d].Err = %v", i, r.Err)
+		}
+	}
+}
+
+func TestCheckAll_Empty(t *testing.T) {
+	got := New(time.Second).CheckAll(context.Background(), nil, 3)
+
+	if len(got) != 0 {
+		t.Errorf("len(results) = %d, want 0", len(got))
+	}
+}
+
+func TestCheckAll_DefaultConcurrency(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+
+	got := New(time.Second).CheckAll(context.Background(), []string{srv.URL, srv.URL}, 0)
+
+	if len(got) != 2 || got[0].Err != nil || got[1].Err != nil {
+		t.Errorf("results = %+v, want 2 successful results", got)
+	}
+}
+
+func TestCheckAll_ContextCanceled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	urls := []string{srv.URL, srv.URL, srv.URL}
+	got := New(time.Second).CheckAll(ctx, urls, 2)
+
+	if len(got) != len(urls) {
+		t.Fatalf("len(results) = %d, want %d", len(got), len(urls))
+	}
+	for i, r := range got {
+		if !errors.Is(r.Err, context.Canceled) {
+			t.Errorf("results[%d].Err = %v, want context.Canceled", i, r.Err)
+		}
 	}
 }
 
