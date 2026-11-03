@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -19,6 +22,16 @@ const DefaultConcurrency = 5
 
 // ErrInvalidURL is returned (wrapped) in Result.Err when the URL fails validation.
 var ErrInvalidURL = errors.New("invalid url")
+
+// ErrBlockedAddress is returned (wrapped) in Result.Err when the destination IP is not public
+// and the Checker was created with WithBlockPrivateIPs.
+var ErrBlockedAddress = errors.New("blocked address")
+
+// nonPublicPrefixes lists ranges that netip.Addr's helper methods do not cover.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"), // carrier-grade NAT
+}
 
 // Result is the outcome of a single URL check.
 type Result struct {
@@ -33,12 +46,36 @@ type Checker struct {
 	client *http.Client
 }
 
+// Option configures a Checker.
+type Option func(*Checker)
+
+// WithBlockPrivateIPs refuses connections to loopback, private, link-local, multicast and
+// unspecified addresses (SSRF protection). The check runs on the resolved IP at dial time,
+// so DNS rebinding cannot bypass it. Proxies are disabled because they would hide the real destination.
+func WithBlockPrivateIPs() Option {
+	return func(c *Checker) {
+		dialer := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   rejectNonPublicAddr,
+		}
+		c.client.Transport = &http.Transport{
+			Proxy:               nil,
+			DialContext:         dialer.DialContext,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConns:        100,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+	}
+}
+
 // New returns a Checker. Redirects are not followed; 3xx responses are reported as-is.
-func New(timeout time.Duration) *Checker {
+func New(timeout time.Duration, opts ...Option) *Checker {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	return &Checker{
+	c := &Checker{
 		client: &http.Client{
 			Timeout: timeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -46,6 +83,40 @@ func New(timeout time.Duration) *Checker {
 			},
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// rejectNonPublicAddr is a net.Dialer.Control hook; address is the already-resolved "ip:port".
+func rejectNonPublicAddr(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrBlockedAddress, err)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrBlockedAddress, err)
+	}
+	if isNonPublic(addr) {
+		return fmt.Errorf("%w: %s", ErrBlockedAddress, addr)
+	}
+	return nil
+}
+
+func isNonPublic(addr netip.Addr) bool {
+	addr = addr.Unmap() // treat ::ffff:127.0.0.1 as 127.0.0.1
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() ||
+		addr.IsMulticast() || addr.IsUnspecified() {
+		return true
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // Check requests rawURL and reports the status code and response time.
