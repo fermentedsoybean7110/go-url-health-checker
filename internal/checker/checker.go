@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 )
 
 // DefaultTimeout is used when a non-positive timeout is given to New.
 const DefaultTimeout = 10 * time.Second
+
+// DefaultConcurrency is used when a non-positive concurrency is given to CheckAll.
+const DefaultConcurrency = 5
 
 // ErrInvalidURL is returned (wrapped) in Result.Err when the URL fails validation.
 var ErrInvalidURL = errors.New("invalid url")
@@ -71,6 +75,41 @@ func (c *Checker) Check(ctx context.Context, rawURL string) Result {
 
 	result.StatusCode = resp.StatusCode
 	return result
+}
+
+// CheckAll checks urls with at most concurrency requests in flight.
+// Results are returned in the same order as urls; duplicates are checked as-is.
+func (c *Checker) CheckAll(ctx context.Context, urls []string, concurrency int) []Result {
+	results := make([]Result, len(urls))
+	if len(urls) == 0 {
+		return results
+	}
+
+	if concurrency <= 0 {
+		concurrency = DefaultConcurrency
+	}
+	workers := min(concurrency, len(urls))
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each worker writes only to its own index, so no lock is needed.
+			for i := range jobs {
+				results[i] = c.Check(ctx, urls[i])
+			}
+		}()
+	}
+
+	for i := range urls {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	return results
 }
 
 func validateURL(rawURL string) error {
