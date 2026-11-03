@@ -91,6 +91,12 @@ Exit codes: `0` when every URL is `OK`, `1` when at least one is `FAIL` or `ERRO
 healthcheck-server [-addr 127.0.0.1:8080] [-timeout 10s] [-concurrency 5]
 ```
 
+| Flag           | Default          | Description                                           |
+| -------------- | ---------------- | ----------------------------------------------------- |
+| `-addr`        | `127.0.0.1:8080` | Listen address (no authentication)                    |
+| `-timeout`     | `10s`            | Timeout per checked URL                               |
+| `-concurrency` | `5`              | Maximum number of concurrent checks per request       |
+
 | Endpoint        | Description                                                  |
 | --------------- | ------------------------------------------------------------ |
 | `POST /check`   | Check up to 50 URLs. Body: `{"urls": ["..."]}` (`Content-Type: application/json`) |
