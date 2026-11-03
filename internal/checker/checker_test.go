@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,8 +19,11 @@ func TestCheck_StatusCodes(t *testing.T) {
 		status int
 	}{
 		{"ok", http.StatusOK},
+		{"no content", http.StatusNoContent},
+		{"moved permanently", http.StatusMovedPermanently},
 		{"not found", http.StatusNotFound},
 		{"server error", http.StatusInternalServerError},
+		{"service unavailable", http.StatusServiceUnavailable},
 	}
 
 	for _, tt := range tests {
@@ -291,6 +296,155 @@ func TestCheckAll_ContextCanceled(t *testing.T) {
 	for i, r := range got {
 		if !errors.Is(r.Err, context.Canceled) {
 			t.Errorf("results[%d].Err = %v, want context.Canceled", i, r.Err)
+		}
+	}
+}
+
+func TestCheck_ContextDeadlineExceeded(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// The client timeout is longer, so the context deadline must be what fires.
+	got := New(5*time.Second).Check(ctx, srv.URL)
+
+	if !errors.Is(got.Err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want context.DeadlineExceeded", got.Err)
+	}
+}
+
+func TestCheck_LargeBodyIsNotRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := make([]byte, 64*1024)
+		for range 256 { // 16 MiB
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	got := New(2*time.Second).Check(context.Background(), srv.URL)
+
+	if got.Err != nil || got.StatusCode != http.StatusOK {
+		t.Errorf("result = %+v, want 200 without error", got)
+	}
+}
+
+func TestCheck_HTTPS(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	t.Run("untrusted certificate is an error", func(t *testing.T) {
+		got := New(time.Second).Check(context.Background(), srv.URL)
+
+		if got.Err == nil {
+			t.Fatal("expected certificate error, got nil")
+		}
+		if got.StatusCode != 0 {
+			t.Errorf("StatusCode = %d, want 0", got.StatusCode)
+		}
+	})
+
+	t.Run("trusted certificate succeeds", func(t *testing.T) {
+		c := New(time.Second)
+		c.client.Transport = srv.Client().Transport
+
+		got := c.Check(context.Background(), srv.URL)
+
+		if got.Err != nil || got.StatusCode != http.StatusOK {
+			t.Errorf("result = %+v, want 200 without error", got)
+		}
+	})
+}
+
+func TestCheckAll_ConcurrencyExceedsURLs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+
+	urls := []string{srv.URL, srv.URL}
+	got := New(time.Second).CheckAll(context.Background(), urls, 100)
+
+	if len(got) != len(urls) {
+		t.Fatalf("len(results) = %d, want %d", len(got), len(urls))
+	}
+	for i, r := range got {
+		if r.Err != nil {
+			t.Errorf("results[%d].Err = %v", i, r.Err)
+		}
+	}
+}
+
+func TestCheckAll_ManyURLsKeepOrder(t *testing.T) {
+	const total = 100
+
+	// The path index selects the status code, so each result can be matched to its input.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(200 + n)
+	}))
+	defer srv.Close()
+
+	urls := make([]string, total)
+	for i := range urls {
+		urls[i] = srv.URL + "/" + strconv.Itoa(i)
+	}
+	got := New(5*time.Second).CheckAll(context.Background(), urls, 8)
+
+	if len(got) != total {
+		t.Fatalf("len(results) = %d, want %d", len(got), total)
+	}
+	for i, r := range got {
+		if r.Err != nil || r.URL != urls[i] || r.StatusCode != 200+i {
+			t.Errorf("results[%d] = %+v, want URL %q status %d", i, r, urls[i], 200+i)
+		}
+	}
+}
+
+func TestCheckAll_CanceledMidway(t *testing.T) {
+	fast := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer fast.Close()
+
+	arrived := make(chan struct{}, 1)
+	slow := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-arrived
+		cancel()
+	}()
+
+	// With a single worker, the first URL completes, the second is in flight when canceled, the rest never start.
+	urls := []string{fast.URL, slow.URL, fast.URL, fast.URL}
+	got := New(5*time.Second).CheckAll(ctx, urls, 1)
+
+	if len(got) != len(urls) {
+		t.Fatalf("len(results) = %d, want %d", len(got), len(urls))
+	}
+	if got[0].Err != nil || got[0].StatusCode != http.StatusOK {
+		t.Errorf("results[0] = %+v, want 200 without error", got[0])
+	}
+	for i := 1; i < len(got); i++ {
+		if !errors.Is(got[i].Err, context.Canceled) {
+			t.Errorf("results[%d].Err = %v, want context.Canceled", i, got[i].Err)
 		}
 	}
 }

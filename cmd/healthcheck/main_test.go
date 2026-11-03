@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fermentedsoybean7110/go-url-health-checker/internal/checker"
 )
 
 func newStatusServer(t *testing.T, status int) *httptest.Server {
@@ -124,6 +126,86 @@ func TestRun_TimeoutFlag(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("took %v, -timeout was not applied", elapsed)
+	}
+}
+
+func TestRun_ZeroFlagsFallBackToDefaults(t *testing.T) {
+	srv := newStatusServer(t, http.StatusOK)
+
+	code, stdout, _ := runCLI(t, "-timeout", "0", "-concurrency", "0", srv.URL)
+
+	if code != exitOK {
+		t.Errorf("exit code = %d, want %d", code, exitOK)
+	}
+	if !strings.HasPrefix(stdout, "OK") {
+		t.Errorf("stdout = %q, want OK line", stdout)
+	}
+}
+
+func TestRun_ErrorLineIncludesCause(t *testing.T) {
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := closed.URL
+	closed.Close()
+
+	_, stdout, _ := runCLI(t, closedURL)
+
+	if !strings.HasPrefix(stdout, "ERROR") || !strings.Contains(stdout, "request failed") {
+		t.Errorf("stdout = %q, want ERROR line with cause", stdout)
+	}
+}
+
+func TestRun_InvalidURL(t *testing.T) {
+	code, stdout, _ := runCLI(t, "ftp://example.com")
+
+	if code != exitFail {
+		t.Errorf("exit code = %d, want %d", code, exitFail)
+	}
+	if !strings.HasPrefix(stdout, "ERROR") || !strings.Contains(stdout, "invalid url") {
+		t.Errorf("stdout = %q, want ERROR line with invalid url", stdout)
+	}
+}
+
+func TestRun_Canceled(t *testing.T) {
+	srv := newStatusServer(t, http.StatusOK)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out, errOut bytes.Buffer
+	code := run(ctx, []string{srv.URL}, &out, &errOut)
+
+	if code != exitFail {
+		t.Errorf("exit code = %d, want %d", code, exitFail)
+	}
+	if !strings.HasPrefix(out.String(), "ERROR") || !strings.Contains(out.String(), "canceled") {
+		t.Errorf("stdout = %q, want ERROR line with canceled", out.String())
+	}
+}
+
+func TestPrintResults_StatusBoundaries(t *testing.T) {
+	tests := []struct {
+		status int
+		want   string
+	}{
+		{199, "FAIL"},
+		{200, "OK"},
+		{299, "OK"},
+		{300, "FAIL"},
+		{404, "FAIL"},
+		{500, "FAIL"},
+	}
+
+	for _, tt := range tests {
+		var out bytes.Buffer
+
+		allOK := printResults(&out, []checker.Result{{URL: "http://example.com", StatusCode: tt.status}})
+
+		if !strings.HasPrefix(out.String(), tt.want) {
+			t.Errorf("status %d: output = %q, want prefix %q", tt.status, out.String(), tt.want)
+		}
+		if allOK != (tt.want == "OK") {
+			t.Errorf("status %d: allOK = %v", tt.status, allOK)
+		}
 	}
 }
 
